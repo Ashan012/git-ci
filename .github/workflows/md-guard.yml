@@ -103,7 +103,9 @@ jobs:
         run: curl -fsSL https://opencode.ai/install | bash -s -- --version 1.19.4 --no-modify-path
 
       - name: Review with OpenCode
+        id: ai
         if: vars.OPENCODE_ENABLED == 'true'
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -148,10 +150,12 @@ jobs:
               [ -n "$file" ] && echo "- \`$file\`"
             done < /tmp/changed-md.txt
             echo
-            if [ "${{ vars.OPENCODE_ENABLED }}" = "true" ]; then
+            if [ "${{ vars.OPENCODE_ENABLED }}" != "true" ]; then
+              echo "Markdown-only check passed. AI review is disabled; set the repository variable \`OPENCODE_ENABLED=true\` to enable it."
+            elif [ "${{ steps.ai.outcome }}" = "success" ]; then
               echo "OpenCode reviewed the changed files."
             else
-              echo "Markdown-only check passed. AI review is disabled; set the repository variable \`OPENCODE_ENABLED=true\` to enable it."
+              echo "Markdown-only check passed. The OpenCode review step failed (see the workflow logs)."
             fi
           } > "reviews/${short}.md"
 

@@ -34,6 +34,8 @@ The pipeline runs with **no API key**. To let OpenCode edit the Markdown before 
 
 After that, pushes run `opencode run` before the review note is created, and `/oc ...` comments work on issues and pull requests.
 
+The AI step is best-effort: if the model fails or runs out of quota, the review note and pull request are still created.
+
 ## Notes
 
 - PRs created with the workflow `GITHUB_TOKEN` do not trigger other workflows. This is expected.
