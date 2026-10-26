@@ -1,0 +1,181 @@
+name: md-guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: md-guard-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    outputs:
+      candidates: ${{ steps.check.outputs.candidates }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed paths
+        id: check
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --name-only --diff-filter=ACMR "${{ github.event.pull_request.base.sha }}...HEAD")
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              files=$(git ls-tree -r --name-only "${{ github.sha }}")
+            else
+              files=$(git diff --name-only --diff-filter=ACMR "$before" "${{ github.sha }}")
+            fi
+          fi
+
+          printf '%s\n' "$files" | sed '/^$/d' > /tmp/changed.txt
+          echo "Changed files:"
+          cat /tmp/changed.txt
+
+          bad=$(grep -vE '(^|/)\.github/|\.md$' /tmp/changed.txt || true)
+          if [ -n "$bad" ]; then
+            echo "::error title=Markdown only::Only .md files (and .github/**) are accepted."
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
+          candidates=0
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              *.md)
+                case "$file" in
+                  reviews/*) ;;
+                  *) candidates=$((candidates + 1)) ;;
+                esac
+                ;;
+            esac
+          done < /tmp/changed.txt
+
+          echo "candidates=$candidates" >> "$GITHUB_OUTPUT"
+          echo "Eligible Markdown files: $candidates"
+
+  review:
+    name: review
+    needs: validate
+    if: |
+      github.event_name == 'push' &&
+      github.event.before != '0000000000000000000000000000000000000000' &&
+      needs.validate.outputs.candidates != '0' &&
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List changed Markdown
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          git diff --name-only --diff-filter=ACMR "$before" "${{ github.sha }}" -- '*.md' > /tmp/changed-md.txt
+          echo "Changed Markdown:"
+          cat /tmp/changed-md.txt
+
+      - name: Install OpenCode
+        if: vars.OPENCODE_ENABLED == 'true'
+        run: curl -fsSL https://opencode.ai/install | bash -s -- --version 1.19.4 --no-modify-path
+
+      - name: Review with OpenCode
+        if: vars.OPENCODE_ENABLED == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENCODE_PERMISSION: '{"edit":"allow","bash":"allow"}'
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.opencode/bin:$PATH"
+
+          files=$(tr '\n' ' ' < /tmp/changed-md.txt)
+          opencode run --model "${{ vars.OPENCODE_MODEL || 'google/gemini-3.7-flash' }}" \
+            "Improve these changed Markdown files: ${files}. Fix typos and clarity, keep the existing headings, and append a short '## Review notes' section to each file. Only edit .md files. Never create or modify any other file."
+
+      - name: Verify only Markdown changed
+        run: |
+          set -euo pipefail
+          changed=$(git status --porcelain=v1 | cut -c4-)
+          [ -z "$changed" ] && exit 0
+
+          bad=$(printf '%s\n' "$changed" | grep -vE '\.md$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error title=Non-Markdown change::Automation changed non-Markdown files."
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
+      - name: Create review note
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          mkdir -p reviews
+
+          {
+            echo "# Review for ${short}"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Date: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "- Triggered by: @${{ github.actor }}"
+            echo
+            echo "## Changed Markdown"
+            echo
+            while IFS= read -r file; do
+              [ -n "$file" ] && echo "- \`$file\`"
+            done < /tmp/changed-md.txt
+            echo
+            if [ "${{ vars.OPENCODE_ENABLED }}" = "true" ]; then
+              echo "OpenCode reviewed the changed files."
+            else
+              echo "Markdown-only check passed. AI review is disabled; set the repository variable \`OPENCODE_ENABLED=true\` to enable it."
+            fi
+          } > "reviews/${short}.md"
+
+      - name: Push branch and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          branch="ci/md-${short}-${GITHUB_RUN_NUMBER}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "[skip ci] Add review notes for ${short}"
+          git push -u origin "$branch"
+
+          body="Automated Markdown review for ${GITHUB_SHA}."
+          body+=$'\n\nChanged files:\n\n'
+          body+="$(sed 's/^/- /' /tmp/changed-md.txt)"
+          gh pr create --base main --head "$branch" \
+            --title "[skip ci] Review notes for ${short}" \
+            --body "$body"
