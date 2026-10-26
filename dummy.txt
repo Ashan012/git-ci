@@ -1,0 +1,1 @@
+dummy text file - md-guard should reject this
